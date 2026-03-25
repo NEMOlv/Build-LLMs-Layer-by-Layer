@@ -327,4 +327,3 @@ class GraphQueryAttention(nn.Module):
         output = self.o_proj(output)
 
         return output
-
