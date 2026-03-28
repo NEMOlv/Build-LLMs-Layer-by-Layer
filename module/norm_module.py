@@ -26,8 +26,8 @@ class BatchNorm(nn.Module):
         # 滑动平均统计量（测试时使用，不需要梯度）
         self.register_buffer("running_mean", torch.zeros(num_features))
         self.register_buffer("running_var", torch.ones(num_features))
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    
+    def _norm(self, x, broadcast_shape: list[int]):
         # 输入形状约定：(N, C, D1, D2, ...)，其中 C = num_features
         # 例如：
         # - 全连接层输入：(N, C)
@@ -37,12 +37,12 @@ class BatchNorm(nn.Module):
         # - 3D 视频输入：(N, C, D, H, W)
 
         # 确定要归一化的维度：除了特征维度 C（dim=1）之外的所有维度
-        reduce_dims = [dim for dim in range(input.dim()) if dim != 1]
+        reduce_dims = [dim for dim in range(x.dim()) if dim != 1]
 
         if self.training:
             # 训练阶段：使用当前 batch 的均值和方差
-            mean = input.mean(dim=reduce_dims, keepdim=False)  # (C,)
-            var = input.var(dim=reduce_dims, unbiased=False, keepdim=False)  # (C,)
+            mean = x.mean(dim=reduce_dims, keepdim=False)  # (C,)
+            var = x.var(dim=reduce_dims, unbiased=False, keepdim=False)  # (C,)
 
             # 更新滑动平均（无梯度）
             with torch.no_grad():
@@ -55,21 +55,24 @@ class BatchNorm(nn.Module):
 
         # 将 mean/var  reshape 为可广播的形状（与 input 维度对齐）
         # 例如 input 是 (N, C, H, W)，则 mean 变为 (1, C, 1, 1)
-        broadcast_shape = [1] * input.dim()
-        broadcast_shape[1] = self.num_features
         mean = mean.view(broadcast_shape)
         var = var.view(broadcast_shape)
 
         # 归一化（与 LayerNorm 公式一致）
-        output = (input - mean) * torch.rsqrt(var + self.eps)
+        return (x - mean) * torch.rsqrt(var + self.eps)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        broadcast_shape = [1] * x.dim()
+        broadcast_shape[1] = self.num_features
+        x = self._norm(x.float(), broadcast_shape)
+        
         # 仿射变换（如果启用）
         if self.affine:
             gamma = self.gamma.view(broadcast_shape)
             beta = self.beta.view(broadcast_shape)
-            output = gamma * output + beta
+            x = gamma * x + beta
 
-        return output
+        return x
 
 class LayerNorm(nn.Module):
     def __init__(
@@ -86,15 +89,17 @@ class LayerNorm(nn.Module):
             self.gamma = nn.Parameter(torch.ones(num_features))
             self.beta = nn.Parameter(torch.zeros(num_features))
         self.eps = eps
+    
+    def _norm(self, x):
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, unbiased=False, keepdim=True)
+        return (x - mean) * torch.rsqrt(var + self.eps)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        mean = input.mean(-1, keepdim=True)
-        var = input.var(-1, unbiased=False, keepdim=True)
-        # rsqrt = 1 / sqrt
-        output = (input - mean) * torch.rsqrt(var + self.eps)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._norm(x.float())
         if self.affine:
-            output = self.gamma * output + self.beta
-        return output
+            x = self.gamma * x + self.beta
+        return x
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
