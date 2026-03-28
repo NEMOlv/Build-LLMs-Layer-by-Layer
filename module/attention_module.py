@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from module.embedding_module import RotaryPositionalEmbedding
 
 
 """
@@ -121,11 +122,32 @@ class MultiHeadAttention(nn.Module):
         self.k_proj = nn.Linear(self.h_dim, self.head_dim * config.num_attention_heads, bias=False)
         self.v_proj = nn.Linear(self.h_dim, self.head_dim * config.num_attention_heads, bias=False)
         self.o_proj = nn.Linear(self.head_dim * config.num_attention_heads, self.h_dim)
-        nn.MultiheadAttention
 
         self.attn_dropout = nn.Dropout(config.attn_dropout_prob)
+        
+        # 初始化旋转位置编码
+        self.RotaryPositionalEmbedding = None
+        if getattr(config, "isRotaryPositional", False):
+            max_pos_emb = getattr(config, "max_position_embeddings", 4096)
+            rope_base = getattr(config, "rope_base", 10000.0)
+            rope_scaling = getattr(config, "rope_scaling", None)
+            rotate_type = getattr(config, "rotate_type", "rotate_interval")
+            self.RotaryPositionalEmbedding = RotaryPositionalEmbedding(
+                dim=self.head_dim,
+                max_position_embeddings=max_pos_emb,
+                rope_base=rope_base,
+                rope_scaling=rope_scaling,
+                rotate_type=rotate_type
+            )
 
     def forward(self, Q_input, K_input=None, V_input=None, attention_mask=None):
+        """
+        Args:
+            Q_input: Query 输入，shape [batch_size, seq_len, hidden_dim]
+            K_input: Key 输入，shape [batch_size, seq_len, hidden_dim]
+            V_input: Value 输入，shape [batch_size, seq_len, hidden_dim]
+            attention_mask: 注意力掩码，shape [batch_size, seq_len] 或 [batch_size, num_heads, seq_len, seq_len]
+        """
         if K_input is None:
             K_input = Q_input
         if V_input is None:
@@ -142,11 +164,19 @@ class MultiHeadAttention(nn.Module):
 
         # QKV重组成多头模式
         # view(b_size, s_len, self.nums_head, self.h_dim) shape: [b_size, s_len, nums_head, head_dim]
+        Q = Q.view(b_size, s_len, self.nums_head, self.head_dim)
+        K = K.view(b_size, s_len, self.nums_head, self.head_dim)
+        V = V.view(b_size, s_len, self.nums_head, self.head_dim)
+
+        # 应用旋转位置编码（如果初始化了）
+        if self.RotaryPositionalEmbedding is not None:
+            Q, K = self.RotaryPositionalEmbedding(Q, K, unsqueeze_dim=1)
+
         # view(b_size, s_len, self.nums_head, self.h_dim).transpose(1,2) shape: [b_size, nums_head, s_len, head_dim]
         # 相当于每一个head，处理s_len/nums_head个token
-        Q = Q.view(b_size, s_len, self.nums_head, self.head_dim).transpose(1,2)
-        K = K.view(b_size, s_len, self.nums_head, self.head_dim).transpose(1,2)
-        V = V.view(b_size, s_len, self.nums_head, self.head_dim).transpose(1,2)
+        Q = Q.transpose(1, 2)
+        K = K.transpose(1, 2)
+        V = V.transpose(1, 2)
 
         # attn_scores shape: [b_size, nums_head, s_len, s_len]
         attn_scores = Q @ K.transpose(-1, -2) * self.scale_factor
@@ -190,8 +220,33 @@ class MutilQueryAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_dim, self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_dim, self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, config.hidden_dim, bias=False)
+        
+        self.attn_dropout = getattr(config, "attention_dropout", 0.1)
+        self.attn_drop = nn.Dropout(self.attn_dropout)
+        
+        # 初始化旋转位置编码
+        self.RotaryPositionalEmbedding = None
+        if getattr(config, "isRotaryPositional", False):
+            max_pos_emb = getattr(config, "max_position_embeddings", 4096)
+            rope_base = getattr(config, "rope_base", 10000.0)
+            rope_scaling = getattr(config, "rope_scaling", None)
+            rotate_type = getattr(config, "rotate_type", "rotate_interval")
+            self.RotaryPositionalEmbedding = RotaryPositionalEmbedding(
+                dim=self.head_dim,
+                max_position_embeddings=max_pos_emb,
+                rope_base=rope_base,
+                rope_scaling=rope_scaling,
+                rotate_type=rotate_type
+            )
 
     def forward(self, Q_input, K_input=None, V_input=None, attention_mask=None):
+        """
+        Args:
+            Q_input: Query 输入，shape [batch_size, seq_len, hidden_dim]
+            K_input: Key 输入，shape [batch_size, seq_len, hidden_dim]
+            V_input: Value 输入，shape [batch_size, seq_len, hidden_dim]
+            attention_mask: 注意力掩码，shape [batch_size, seq_len] 或 [batch_size, num_heads, seq_len, seq_len]
+        """
         if K_input is None:
             K_input = Q_input
         if V_input is None:
@@ -207,7 +262,9 @@ class MutilQueryAttention(nn.Module):
         K = K.view(b_size, s_len, 1, self.head_dim)
         V = V.view(b_size, s_len, 1, self.head_dim)
 
-        # 中间要加位置编码
+        # 应用旋转位置编码（如果初始化了）
+        if self.RotaryPositionalEmbedding is not None:
+            Q, K = self.RotaryPositionalEmbedding(Q, K, unsqueeze_dim=1)
 
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)
@@ -269,6 +326,21 @@ class GraphQueryAttention(nn.Module):
         
         self.attn_dropout = getattr(config, "attention_dropout", 0.1)
         self.attn_drop = nn.Dropout(self.attn_dropout)
+        
+        # 初始化旋转位置编码
+        self.RotaryPositionalEmbedding = None
+        if getattr(config, "isRotaryPositional", False):
+            max_pos_emb = getattr(config, "max_position_embeddings", 4096)
+            rope_base = getattr(config, "rope_base", 10000.0)
+            rope_scaling = getattr(config, "rope_scaling", None)
+            rotate_type = getattr(config, "rotate_type", "rotate_interval")
+            self.RotaryPositionalEmbedding = RotaryPositionalEmbedding(
+                dim=self.head_dim,
+                max_position_embeddings=max_pos_emb,
+                rope_base=rope_base,
+                rope_scaling=rope_scaling,
+                rotate_type=rotate_type
+            )
 
     def forward(self, Q_input, K_input=None, V_input=None, attention_mask=None, attention_bias=None):
         """
@@ -293,6 +365,10 @@ class GraphQueryAttention(nn.Module):
         Q = Q.view(b_size, s_len, self.num_attention_heads, self.head_dim)
         K = K.view(b_size, s_len, self.num_key_value_heads, self.head_dim)
         V = V.view(b_size, s_len, self.num_key_value_heads, self.head_dim)
+
+        # 应用旋转位置编码（如果初始化了）
+        if self.RotaryPositionalEmbedding is not None:
+            Q, K = self.RotaryPositionalEmbedding(Q, K, unsqueeze_dim=1)
 
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)

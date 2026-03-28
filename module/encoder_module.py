@@ -4,9 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from module.attention_module import MultiHeadAttention, GraphQueryAttention
-from module.embedding_module import TransformerEmbedding, BartEmbedding
+from module.embedding_module import TransformerEmbedding, BartEmbedding, RelativePositionEmbedding
 from module.ffn_module import TransformerFFN
-from module.relative_position_bias import RelativePositionBias
 from model.t5_config import T5Config
 
 
@@ -72,7 +71,7 @@ class UniversalEncoder(nn.Module):
         
         self.use_relative_position_bias = use_relative_position_bias
         if use_relative_position_bias and hasattr(config, "relative_attention_num_buckets"):
-            self.relative_position_bias = RelativePositionBias(
+            self.relative_position_bias = RelativePositionEmbedding(
                 num_buckets=config.relative_attention_num_buckets,
                 max_distance=config.relative_attention_max_distance,
                 num_heads=getattr(config, 'num_heads', config.num_attention_heads),

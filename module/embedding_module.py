@@ -1,7 +1,7 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from typing import Tuple, Optional
 
 """
      symbols:
@@ -16,17 +16,11 @@ import torch.nn.functional as F
         attn: attention
 """
 
-# Token向量
-# 实际上通常都会直接使用nn.Embedding
-class TokenEmbedding(nn.Embedding):
-    def __init__(self, config):
-        super(TokenEmbedding, self).__init__(config.vocab_size, config.hidden_dim)
-
 # sin/cos位置编码向量 (transformer论文称其为Sinusoidal Positional Embedding)
 # 但实际上是偶数用正弦sin, 奇数用余弦cos
-class SinusoidalPositionalEmbedding(nn.Module):
+class SinusoidalPositionEmbedding(nn.Module):
     def __init__(self, config):
-        super(SinusoidalPositionalEmbedding, self).__init__()
+        super(SinusoidalPositionEmbedding, self).__init__()
         # 创建位置编码矩阵
         self.encoding = torch.zeros(config.max_len, config.hidden_dim, device=config.device)
         self.encoding.requires_grad_(False)
@@ -46,11 +40,442 @@ class SinusoidalPositionalEmbedding(nn.Module):
         return self.encoding[:input.shape[1], :]
 
 
+
+
+class RelativePositionEmbedding(nn.Module):
+    """
+    相对位置编码
+
+    核心思想：
+    - 考虑了 token 之间的相对距离，使模型能够更好地处理长序列和泛化到训练时未见过的序列长度
+    - 使用对数分桶（logarithmic bucketing）技术减少参数数量
+
+    工程特性：
+    - 支持双向（编码器）和单向（解码器）模式
+    - 可以独立于特定的注意力机制使用
+    - 可与 MHA、MQA、GQA 等多种注意力机制配合使用
+
+    数学公式：
+        attention_score = q @ k^T / sqrt(d_k) + relative_position_bias
+
+    参考文献：
+    - T5 论文: https://arxiv.org/abs/1910.10683
+    """
+
+    def __init__(
+            self,
+            num_buckets: int = 32,
+            max_distance: int = 128,
+            num_heads: int = 8,
+    ):
+        """
+        初始化相对位置偏置模块
+        
+        Args:
+            num_buckets: 相对位置的 bucket 数量，默认 32
+                - 更多的 bucket 可以提供更精细的位置表示，但会增加参数量
+                - T5 论文中使用 32 个 bucket
+            max_distance: 最大距离，超过这个距离的都会被放到同一个 bucket，默认 128
+                - 超过 max_distance 的相对位置不会被区分
+                - 这样可以限制参数量，同时保持对长距离的一定感知能力
+            num_heads: 注意力头的数量，默认 8
+                - 每个注意力头会学习独立的相对位置偏置
+        """
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.num_heads = num_heads
+        
+        # Embedding 层，用于存储每个 bucket 的偏置值
+        # shape: [num_buckets, num_heads]
+        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads)
+
+    @staticmethod
+    def _relative_position_bucket(
+            relative_position: torch.Tensor,
+            bidirectional: bool = True,
+            num_buckets: int = 32,
+            max_distance: int = 128
+    ) -> torch.Tensor:
+        """
+        将相对位置转换为 bucket 索引
+        
+        这是 T5 相对位置编码的核心算法，使用对数分桶技术：
+        
+        算法原理：
+            1. 对于小距离（小于 max_exact），使用精确的整数表示
+            2. 对于大距离（大于等于 max_exact），使用对数尺度
+            3. 这样可以在保持精细局部信息的同时，减少对长距离的参数需求
+        
+        数学表示：
+            if distance < max_exact:
+                bucket = distance
+            else:
+                bucket = max_exact + log(distance / max_exact) * (num_buckets - max_exact) / log(max_distance / max_exact)
+        
+        Args:
+            relative_position: 相对位置张量，shape [query_len, key_len]
+                每个元素表示 key_position - query_position
+                正值表示 key 在 query 后面
+                负值表示 key 在 query 前面
+            bidirectional: 是否为双向（编码器使用双向，解码器使用单向）
+                - 双向：区分正负相对位置（前面和后面）
+                - 单向：只考虑非负相对位置（解码器自注意力）
+            num_buckets: bucket 数量
+            max_distance: 最大距离
+            
+        Returns:
+            bucket 索引，shape [query_len, key_len]
+            每个元素是一个整数，表示对应相对位置所属的 bucket
+        """
+        relative_buckets = 0
+        
+        # 步骤 1：处理双向模式
+        if bidirectional:
+            # 双向模式下，将 bucket 分成两半
+            # 前一半用于负相对位置（key 在 query 前面）
+            # 后一半用于正相对位置（key 在 query 后面）
+            num_buckets //= 2
+            # 标记正相对位置
+            relative_buckets += (relative_position > 0).to(torch.long) * num_buckets
+            # 取绝对值，后续只需要处理距离大小
+            relative_position = torch.abs(relative_position)
+        else:
+            # 单向模式下（解码器），只考虑非负相对位置
+            # 将负值裁剪为 0（因为解码器只能看到前面的 token）
+            relative_position = -torch.min(relative_position, torch.zeros_like(relative_position))
+        
+        # 步骤 2：计算精确表示的最大距离
+        # max_exact 是我们使用精确整数表示的最大距离
+        max_exact = num_buckets // 2
+        
+        # 标记哪些相对位置是小距离（可以精确表示）
+        is_small = relative_position < max_exact
+        
+        # 步骤 3：处理大距离（使用对数分桶）
+        # 对于大于等于 max_exact 的距离，使用对数尺度
+        # 这样可以在保持参数数量可控的同时，仍能感知长距离关系
+        relative_position_if_large = max_exact + (
+                # 对数计算：log(distance / max_exact)
+                torch.log(relative_position.float() / max_exact)
+                # 归一化到 [0, 1] 范围（相对于 max_distance）
+                / math.log(max_distance / max_exact)
+                # 映射到剩余的 bucket 数量
+                * (num_buckets - max_exact)
+        ).to(torch.long)
+        
+        # 确保不超出 bucket 范围
+        relative_position_if_large = torch.min(
+            relative_position_if_large,
+            torch.full_like(relative_position_if_large, num_buckets - 1)
+        )
+        
+        # 步骤 4：合并小距离和大距离的 bucket 索引
+        # 对于小距离，直接使用相对位置值
+        # 对于大距离，使用对数分桶后的值
+        relative_buckets += torch.where(is_small, relative_position, relative_position_if_large)
+        
+        return relative_buckets
+
+    def forward(
+            self,
+            query_length: int,
+            key_length: int,
+            bidirectional: bool = True,
+            device: torch.device = None,
+    ) -> torch.Tensor:
+        """
+        计算相对位置偏置
+        
+        这是模块的前向传播函数，执行以下步骤：
+            1. 生成所有 query 和 key 的位置索引
+            2. 计算每对 (query, key) 之间的相对位置
+            3. 将相对位置映射到 bucket 索引
+            4. 通过 embedding 层获取每个 bucket 的偏置值
+            5. 调整维度顺序以适应注意力计算
+        
+        Args:
+            query_length: query 的长度（自注意力中等于序列长度）
+            key_length: key 的长度（自注意力中等于序列长度）
+            bidirectional: 是否为双向
+                - 编码器：True（可以看到前后所有 token）
+                - 解码器自注意力：False（只能看到前面的 token）
+                - 解码器交叉注意力：True（可以看到编码器的所有 token）
+            device: 计算设备
+                - 如果为 None，使用 relative_attention_bias.weight.device
+            
+        Returns:
+            相对位置偏置，shape [num_heads, query_length, key_length]
+            可以直接加到 attention score 上：
+                attention_score = attention_score + relative_position_bias
+        """
+        # 步骤 1：确定计算设备
+        if device is None:
+            device = self.relative_attention_bias.weight.device
+        
+        # 步骤 2：生成 query 和 key 的位置索引
+        # context_position: [query_length, 1] - query 的位置索引，扩展为列向量
+        # 例如，query_length=3 时：[[0], [1], [2]]
+        context_position = torch.arange(query_length, dtype=torch.long, device=device)[:, None]
+        
+        # memory_position: [1, key_length] - key 的位置索引，扩展为行向量
+        # 例如，key_length=3 时：[[0, 1, 2]]
+        memory_position = torch.arange(key_length, dtype=torch.long, device=device)[None, :]
+        
+        # 步骤 3：计算相对位置
+        # relative_position = memory_position - context_position
+        # 使用广播机制，得到 [query_length, key_length] 的矩阵
+        # 每个元素 (i, j) 表示 memory_position[j] - context_position[i]
+        # 正值表示 key j 在 query i 后面
+        # 负值表示 key j 在 query i 前面
+        # 0 表示同一个位置
+        #
+        # 示例：
+        # context_position = [[0], [1], [2]]
+        # memory_position = [[0, 1, 2]]
+        # relative_position = [[0-0, 1-0, 2-0],
+        #                     [0-1, 1-1, 2-1],
+        #                     [0-2, 1-2, 2-2]]
+        #                   = [[0, 1, 2],
+        #                      [-1, 0, 1],
+        #                      [-2, -1, 0]]
+        relative_position = memory_position - context_position
+        
+        # 步骤 4：将相对位置映射到 bucket 索引
+        relative_position_bucket = self._relative_position_bucket(
+            relative_position,
+            bidirectional=bidirectional,
+            num_buckets=self.num_buckets,
+            max_distance=self.max_distance
+        )
+        
+        # 确保 bucket 索引在正确的设备上
+        relative_position_bucket = relative_position_bucket.to(self.relative_attention_bias.weight.device)
+        
+        # 步骤 5：通过 embedding 层获取偏置值
+        # values shape: [query_length, key_length, num_heads]
+        values = self.relative_attention_bias(relative_position_bucket)
+        
+        # 步骤 6：调整维度顺序
+        # 从 [query_length, key_length, num_heads]
+        # 转换为 [num_heads, query_length, key_length]
+        # 这样可以直接与 attention score 相加（attention score 通常是 [batch, num_heads, query_len, key_len]）
+        values = values.permute([2, 0, 1])
+        
+        return values
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    """
+    旋转位置编码 (Rotary Positional Embedding, RoPE) 模块
+
+    核心思想：
+    - 可以直接在查询和键向量上应用旋转操作，而不需要显式的位置嵌入
+
+    关键特性：
+    - 支持两种旋转方式：rotate_interval（相邻对旋转）和 rotate_half（前后半旋转）
+    - 支持可选的 RoPE 缩放（rope_scaling），用于扩展上下文长度
+    - 预计算频率，提高推理效率
+    - 可与 MHA、MQA、GQA 等多种注意力机制配合使用
+
+    数学公式：
+        q_rotated = q * cos + rotate(q) * sin
+        k_rotated = k * cos + rotate(k) * sin
+
+    参考文献：
+    - RoPE 论文: https://arxiv.org/abs/2104.09864
+    - Llama 论文: https://arxiv.org/abs/2302.13971
+    """
+
+    def __init__(
+            self,
+            dim: int,
+            max_position_embeddings: int = 4096,
+            rope_base: float = 10000.0,
+            rope_scaling: Optional[dict] = None,
+            rotate_type: str = "rotate_interval",
+    ):
+        """
+        初始化旋转位置编码模块
+        
+        Args:
+            dim: 每个注意力头的维度（head_dim）
+            max_position_embeddings: 最大位置嵌入数，默认 4096
+            rope_base: RoPE 的基础频率，默认 10000.0
+            rope_scaling: RoPE 缩放配置，用于扩展上下文长度
+                示例: {
+                    "original_max_position_embeddings": 2048,
+                    "factor": 4,
+                    "beta_fast": 4.0,
+                    "beta_slow": 1.0
+                }
+            rotate_type: 旋转类型，"rotate_interval"（相邻对旋转）或 "rotate_half"（前后半旋转）
+                - rotate_interval: 将相邻两个向量的第一个当作实部，第二个当作虚部
+                - rotate_half: 将前半部分向量当作实部，后半部分向量当作虚部
+        """
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.rope_base = rope_base
+        self.rope_scaling = rope_scaling
+        self.rotate_type = rotate_type
+        
+        # 预计算频率
+        cos, sin = self._precompute_freqs(
+            dim=dim,
+            end=max_position_embeddings,
+            rope_base=rope_base,
+            rope_scaling=rope_scaling,
+            rotate_type=rotate_type
+        )
+        
+        # 注册为 buffer，这样可以随模型保存和加载
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
+
+    @staticmethod
+    def _precompute_freqs(
+            dim: int,
+            end: int = 32 * 1024,
+            rope_base: float = 10000.0,
+            rope_scaling: Optional[dict] = None,
+            rotate_type: str = "rotate_interval"
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        预计算旋转位置编码的频率
+        
+        Args:
+            dim: 每个注意力头的维度
+            end: 最大位置
+            rope_base: RoPE 的基础频率
+            rope_scaling: RoPE 缩放配置
+            rotate_type: 旋转类型
+            
+        Returns:
+            (cos, sin): 预计算的余弦和正弦值，shape [end, dim]
+        """
+        freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+        
+        if rope_scaling is not None:
+            original_max, factor, beta_fast, beta_slow = (
+                rope_scaling.get("original_max_position_embeddings", 2048),
+                rope_scaling.get("factor", 4),
+                rope_scaling.get("beta_fast", 4.0),
+                rope_scaling.get("beta_slow", 1.0),
+            )
+
+            if end / original_max > 1.0:
+                corr_dim = [i if 2 * math.pi / freqs[i] > original_max else dim // 2 for i in range(dim // 2)]
+                power = torch.arange(0, dim // 2, device=freqs.device).float() / max(dim // 2 - 1, 1)
+                beta = beta_slow + (beta_fast - beta_slow) * power
+                scale = torch.where(
+                    torch.arange(dim // 2, device=freqs.device) < corr_dim,
+                    (beta * factor - beta + 1) / (beta * factor),
+                    1.0 / factor,
+                )
+
+                freqs = freqs * scale
+
+        t = torch.arange(end, device=freqs.device)
+        freqs = torch.outer(t, freqs).float()
+        
+        if rotate_type == "rotate_half":
+            freqs = torch.cat((freqs, freqs), dim=-1)
+            cos = freqs.cos()
+            sin = freqs.sin()
+        else:
+            cos = torch.cos(freqs).repeat_interleave(2, dim=-1)
+            sin = torch.sin(freqs).repeat_interleave(2, dim=-1)
+
+        return cos, sin
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """
+        旋转前后部分
+        
+        1. 分割张量：将张量分割为前半部分和后半部分，并对后半部分取负
+        2. 旋转操作：将后半部分拼接至前半部分的前方
+        
+        数学含义：将前半部分向量当作实部，后半部分向量当作虚部
+        
+        Args:
+            x: 输入张量，shape [..., dim]
+            
+        Returns:
+            旋转后的张量，shape [..., dim]
+        """
+        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+
+    @staticmethod
+    def _rotate_interval(x: torch.Tensor) -> torch.Tensor:
+        """
+        旋转相邻对
+        
+        1. 分割张量：将张量分割为奇数部分和偶数部分，并对奇数部分取负
+        2. 旋转操作：将奇数部分交错插入偶数部分
+        
+        数学含义：将相邻两个向量的第一个当作实部，第二个当作虚部
+        
+        Args:
+            x: 输入张量，shape [..., dim]
+            
+        Returns:
+            旋转后的张量，shape [..., dim]
+        """
+        return torch.stack([-x[..., 1::2], x[..., ::2]], dim=-1).flatten(-2)
+
+    def forward(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            position_ids: Optional[torch.Tensor] = None,
+            unsqueeze_dim: int = 1,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        应用旋转位置编码到查询和键向量
+        
+        Args:
+            q: 查询向量，shape [batch_size, seq_len, num_heads, head_dim] 或 [batch_size, num_heads, seq_len, head_dim]
+            k: 键向量，shape 与 q 相同
+            position_ids: 位置索引，shape [batch_size, seq_len]，None 表示从 0 开始
+            unsqueeze_dim: 扩展维度的位置，用于匹配 q/k 的形状
+            
+        Returns:
+            (q_rotated, k_rotated): 旋转后的查询和键向量，shape 与输入相同
+        """
+        # 确定旋转函数
+        if self.rotate_type == "rotate_half":
+            rotate = self._rotate_half
+        else:
+            rotate = self._rotate_interval
+        
+        seq_len = q.shape[1] if q.dim() == 4 else q.shape[2]
+        
+        # 获取预计算的 cos 和 sin
+        cos = self.cos[:seq_len]
+        sin = self.sin[:seq_len]
+        
+        # 调整维度以匹配 q/k 的形状
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        
+        # 应用旋转位置编码
+        q_rotated = (q * cos) + (rotate(q) * sin)
+        k_rotated = (k * cos) + (rotate(k) * sin)
+        
+        return q_rotated, k_rotated
+
+
 class TransformerEmbedding(nn.Module):
     def __init__(self, config):
         super(TransformerEmbedding, self).__init__()
-        self.token_embedding = TokenEmbedding(config)
-        self.position_embedding = SinusoidalPositionalEmbedding(config)
+        self.token_embedding = nn.Embedding(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            padding_idx=config.padding_idx
+        )
+        self.position_embedding = SinusoidalPositionEmbedding(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, input):
@@ -69,30 +494,27 @@ class BertEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        # 使用 embedding_size（ALBERT）或默认 hidden_size
-        embedding_dim = getattr(config, 'embedding_size', config.hidden_size)
-
         # 1. Token Embeddings（对应图中黄色Token Embeddings行）
         self.Token_Embeddings = nn.Embedding(
             num_embeddings=config.vocab_size,
-            embedding_dim=embedding_dim,
+            embedding_dim=config.hidden_size,
             padding_idx=config.padding_idx
         )
 
         # 2. Segment Embeddings（对应图中绿色Segment Embeddings行，E_A/E_B）
         self.Segment_Embeddings = nn.Embedding(
             num_embeddings=config.type_vocab_size,
-            embedding_dim=embedding_dim
+            embedding_dim=config.hidden_size
         )
 
         # 3. Position Embeddings（对应图中白色Position Embeddings行，E0~E10）
         self.Position_Embeddings = nn.Embedding(
             num_embeddings=config.max_position_embeddings,
-            embedding_dim=embedding_dim
+            embedding_dim=config.hidden_size
         )
 
         # 图中相加后的归一化和Dropout
-        self.LayerNorm = nn.LayerNorm(embedding_dim, eps=config.layer_norm_eps)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.Dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, input_ids: torch.Tensor, segment_ids: torch.Tensor = None):
