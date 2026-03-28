@@ -130,3 +130,50 @@ class BertEmbedding(nn.Module):
 
         return Embeddings
 
+
+class BartEmbedding(nn.Module):
+    """
+    BART 嵌入层，使用绝对位置编码
+    
+    BART 使用标准的绝对位置编码，与 BERT 类似但不需要 segment 嵌入。
+    仅包含 token 嵌入和位置嵌入。
+    """
+    def __init__(self, config):
+        super().__init__()
+        
+        self.padding_idx = config.pad_token_id
+        self.embed_tokens = nn.Embedding(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.d_model,
+            padding_idx=self.padding_idx
+        )
+        
+        self.embed_positions = nn.Embedding(
+            num_embeddings=config.max_position_embeddings,
+            embedding_dim=config.d_model
+        )
+        
+        self.LayerNorm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.Dropout = nn.Dropout(config.dropout_rate)
+    
+    def forward(self, input_ids):
+        """
+        Args:
+            input_ids: 输入 token id 序列，shape [batch_size, seq_len]
+        Returns:
+            embeddings: 嵌入向量，shape [batch_size, seq_len, d_model]
+        """
+        seq_len = input_ids.size(1)
+        device = input_ids.device
+        
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
+        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        
+        token_emb = self.embed_tokens(input_ids)
+        position_emb = self.embed_positions(position_ids)
+        
+        embeddings = token_emb + position_emb
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.Dropout(embeddings)
+        
+        return embeddings
