@@ -40,6 +40,113 @@ class SinusoidalPositionEmbedding(nn.Module):
         return self.encoding[:input.shape[1], :]
 
 
+class LearnableAbsolutePositionEmbedding(nn.Module):
+    """
+    可学习的绝对位置编码 (Learnable Absolute Position Embedding) 模块
+
+    核心思想：
+    - 为每个位置学习独立的嵌入向量，通过反向传播优化
+    - 简单直观，被 BERT、GPT-1/2 等经典模型采用
+    - 注意：Transformer 原论文使用的是正弦/余弦编码，
+            但 BERT/GPT 等实际实现改用可学习编码，效果更好
+
+    关键特性：
+    - 可学习参数：位置嵌入矩阵会在训练过程中更新
+    - 支持变长序列：自动截取或扩展到输入序列长度
+    - 易于集成：可以直接与 token embedding 相加
+    - 训练稳定：绝对位置编码提供明确的位置信号
+
+    数学表示：
+        position_embedding[pos] = learnable_parameter[pos]
+        output = token_embedding + position_embedding
+
+    参考文献：
+    - BERT 论文: https://arxiv.org/abs/1810.04805
+    - GPT 论文: https://s3-us-west-2.amazonaws.com/openai-assets/research-covers/language-unsupervised/language_understanding_paper.pdf
+    - Transformer 原论文（正弦编码）: https://arxiv.org/abs/1706.03762
+    """
+
+    def __init__(
+            self,
+            hidden_dim: int,
+            max_position_embeddings: int = 512,
+            padding_idx: Optional[int] = None,
+    ):
+        """
+        初始化可学习的绝对位置编码模块
+
+        Args:
+            hidden_dim: 嵌入维度，需要与 token embedding 维度保持一致
+            max_position_embeddings: 最大支持的序列长度，默认 512
+            padding_idx: 填充 token 的索引，该位置的梯度不会被更新（可选）
+                - 如果提供，padding_idx，该位置的嵌入向量不会被训练
+                - 通常用于处理 padding token 的位置
+        """
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.padding_idx = padding_idx
+
+        # 创建可学习的位置嵌入参数矩阵
+        # shape: [max_position_embeddings, hidden_dim]
+        # 为每个位置学习独立的嵌入向量
+        self.position_embeddings = nn.Embedding(
+            num_embeddings=max_position_embeddings,
+            embedding_dim=hidden_dim,
+            padding_idx=padding_idx
+        )
+
+    def forward(
+            self,
+            input_or_shape,
+            position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        前向传播：生成位置嵌入
+
+        支持两种使用方式：
+        1. 通过 input_or_shape 自动生成位置索引
+        2. 直接传入 position_ids 指定位置索引
+
+        Args:
+            input_or_shape: 输入张量或输入形状
+                - 如果是 Tensor: shape [batch_size, seq_len] 或 [batch_size, seq_len, hidden_dim]
+                - 如果是 tuple: (batch_size, seq_len)
+            position_ids: 位置索引，shape [batch_size, seq_len]，None 表示从 0 开始自动生成
+                - 用于自定义位置（如 padding 后的位置）
+
+        Returns:
+            position_embeddings: 位置嵌入张量，shape [batch_size, seq_len, hidden_dim]
+        """
+        # 确定输入序列长度和 batch size
+        if isinstance(input_or_shape, torch.Tensor):
+            if input_or_shape.dim() == 3:
+                batch_size, seq_len = input_or_shape.shape[0], input_or_shape.shape[1]
+            else:
+                batch_size, seq_len = input_or_shape.shape[0], input_or_shape.shape[1]
+        else:
+            batch_size, seq_len = input_or_shape
+
+        # 生成位置索引
+        if position_ids is None:
+            # 自动生成从 0 到 seq_len-1 的位置索引
+            position_ids = torch.arange(seq_len, dtype=torch.long, device=self.position_embeddings.weight.device)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, seq_len)
+
+        # 确保位置索引不超过最大位置嵌入数
+        # 如果输入序列长度超过 max_position_embeddings，截断
+        position_ids = torch.clamp(position_ids, 0, self.max_position_embeddings - 1)
+
+        # 获取位置嵌入
+        position_embeddings = self.position_embeddings(position_ids)
+
+        return position_embeddings
+
+    def extra_repr(self) -> str:
+        """返回模块的字符串表示，用于打印和调试"""
+        return (f'hidden_dim={self.hidden_dim}, '
+                f'max_position_embeddings={self.max_position_embeddings}, '
+                f'padding_idx={self.padding_idx}')
 
 
 class RelativePositionEmbedding(nn.Module):
