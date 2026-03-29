@@ -149,6 +149,157 @@ class LearnableAbsolutePositionEmbedding(nn.Module):
                 f'padding_idx={self.padding_idx}')
 
 
+class AttentionWithLinearBiases(nn.Module):
+    """
+    Attention with Linear Biases (ALiBi) 模块
+
+    核心思想：
+    - 不在嵌入层添加位置编码，而是在注意力分数上添加线性偏置
+    - 每个注意力头学习不同的斜率参数，控制对相对位置的敏感度
+    - 支持训练时使用短序列、推理时扩展到更长序列，无需重新训练
+
+    关键特性：
+    - 无显式位置嵌入：不增加 embedding 维度的参数量
+    - 长度外推能力：训练 512，推理 4k+ 效果良好
+    - 代码简洁：只需在 attention score 上添加偏置
+    - 训练稳定：无需担心位置编码的优化问题
+
+    数学表示：
+        attention_score = q @ k^T / sqrt(d_k)
+        attention_score = attention_score + bias
+        where bias[i, j] = -m * |i - j|
+        m 是每个头学习的斜率参数
+
+    参考文献：
+    - ALiBi 论文: https://arxiv.org/abs/2108.12409
+    """
+
+    def __init__(
+            self,
+            num_heads: int,
+            max_positions: int = 4096,
+            train_max_positions: Optional[int] = None,
+    ):
+        """
+        初始化 ALiBi 模块
+
+        Args:
+            num_heads: 注意力头的数量
+            max_positions: 最大支持的序列长度，默认 4096
+            train_max_positions: 训练时的最大序列长度（用于外推场景），
+                如果为 None 则等于 max_positions
+                - 例如：训练时用 512，推理时用 4096
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.max_positions = max_positions
+        self.train_max_positions = train_max_positions or max_positions
+
+        # 为每个注意力头计算斜率 m
+        # 按照 ALiBi 论文的建议：
+        # m = 2^(-8/num_heads * (i+1))  for i in 0..num_heads-1
+        # 这种几何级数分配让不同头对不同距离的敏感度不同
+        m = torch.tensor(
+            [2 ** (-8 / num_heads * (i + 1)) for i in range(num_heads)],
+            dtype=torch.float32
+        )
+        
+        # 注册为 buffer（不需要梯度，但会随模型保存）
+        self.register_buffer("m", m)
+
+        # 预计算最大长度的偏置矩阵（训练时可以只计算需要的长度）
+        self._precompute_bias(max_positions)
+
+    def _precompute_bias(self, max_len: int) -> None:
+        """
+        预计算偏置矩阵
+
+        Args:
+            max_len: 预计算的最大长度
+        """
+        device = self.m.device
+        
+        # 生成位置索引
+        pos = torch.arange(max_len, device=device)
+        
+        # 计算相对位置矩阵 [max_len, max_len]
+        # rel_pos[i, j] = |i - j|
+        rel_pos = torch.abs(pos.unsqueeze(1) - pos.unsqueeze(0))
+        
+        # 计算偏置矩阵 [num_heads, max_len, max_len]
+        # bias[h, i, j] = -m[h] * |i - j|
+        bias = -self.m.view(-1, 1, 1) * rel_pos.unsqueeze(0)
+        
+        # 注册为 buffer
+        if hasattr(self, "bias"):
+            self.bias = bias
+        else:
+            self.register_buffer("bias", bias)
+
+    def forward(
+            self,
+            attention_scores: torch.Tensor,
+            key_len: Optional[int] = None,
+            query_len: Optional[int] = None,
+            use_cache: bool = False,
+    ) -> torch.Tensor:
+        """
+        前向传播：将 ALiBi 偏置添加到注意力分数上
+
+        支持两种使用方式：
+        1. 标准模式：传入完整的 attention_scores，形状 [batch, num_heads, query_len, key_len]
+        2. 增量解码模式：use_cache=True，支持自回归生成
+
+        Args:
+            attention_scores: 注意力分数张量
+                形状: [batch_size, num_heads, query_length, key_length]
+            key_len: key 的长度（可选，自动推断）
+            query_len: query 的长度（可选，自动推断）
+            use_cache: 是否使用缓存（用于增量解码）
+
+        Returns:
+            attention_scores_with_bias: 添加了 ALiBi 偏置的注意力分数
+                形状与输入相同
+        """
+        batch_size, num_heads, q_len, k_len = attention_scores.shape
+        
+        # 验证头数量匹配
+        assert num_heads == self.num_heads, \
+            f"注意力头数量不匹配: 期望 {self.num_heads}, 实际 {num_heads}"
+        
+        # 确定需要的偏置长度
+        required_len = max(q_len, k_len)
+        
+        # 如果需要的长度超过预计算的，重新计算
+        if required_len > self.bias.shape[1]:
+            self._precompute_bias(required_len)
+        
+        # 截取需要的偏置部分
+        # 对于自回归生成，query_len=1，key_len=past+current
+        bias = self.bias[:, :q_len, :k_len]
+        
+        # 扩展 batch 维度并添加偏置
+        # bias: [num_heads, q_len, k_len] -> [1, num_heads, q_len, k_len]
+        attention_scores = attention_scores + bias.unsqueeze(0)
+        
+        return attention_scores
+
+    def get_alibi_slopes(self) -> torch.Tensor:
+        """
+        获取每个注意力头的 ALiBi 斜率参数
+
+        Returns:
+            slopes: 斜率张量，shape [num_heads]
+        """
+        return self.m.clone()
+
+    def extra_repr(self) -> str:
+        """返回模块的字符串表示，用于打印和调试"""
+        return (f'num_heads={self.num_heads}, '
+                f'max_positions={self.max_positions}, '
+                f'train_max_positions={self.train_max_positions}')
+                
+
 class RelativePositionEmbedding(nn.Module):
     """
     相对位置编码
