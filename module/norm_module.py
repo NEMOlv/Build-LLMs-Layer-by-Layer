@@ -113,3 +113,12 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         return (self.gamma * self._norm(x.float())).type_as(x)
+
+
+class WeightNormLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, eps: float = 1e-5):
+        super().__init__()
+        self.WeightNormLinear = nn.utils.weight_norm(nn.Linear(in_features=in_features, out_features=out_features), name='weight', dim=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.WeightNormLinear(x)
