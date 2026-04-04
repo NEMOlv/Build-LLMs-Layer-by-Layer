@@ -819,5 +819,62 @@ def create_llama_dataset(
     )
 
 
+def create_qwen_dataset(
+    data_path,
+    tokenizer,
+    task_types=None,
+    **kwargs
+):
+    """
+    创建 Qwen 预训练数据集的便捷函数
+    
+    Qwen 预训练任务：仅因果语言建模 (Causal Language Modeling)
+    不需要特殊的掩码任务，只需要标准的 decoder-only 格式
+    
+    Args:
+        data_path: 数据路径
+        tokenizer: tokenizer
+        task_types: 要执行的任务列表，None 表示无特殊任务（仅 CLM）
+        **kwargs: 其他参数
+    
+    Returns:
+        UnifiedDataset 实例
+    """
+    return UnifiedDataset(
+        data_path=data_path,
+        tokenizer=tokenizer,
+        task_types=task_types or [],
+        model_style="decoder_only",
+        **kwargs
+    )
 
+
+def create_deepseek_dataset(
+    data_path,
+    tokenizer,
+    task_types=None,
+    **kwargs
+):
+    """
+    创建 DeepSeek 预训练数据集的便捷函数
+
+    DeepSeek 预训练任务：仅因果语言建模 (Causal Language Modeling)
+    不需要特殊的掩码任务，只需要标准的 decoder-only 格式
+
+    Args:
+        data_path: 数据路径
+        tokenizer: tokenizer
+        task_types: 要执行的任务列表，None 表示无特殊任务（仅 CLM）
+        **kwargs: 其他参数
+
+    Returns:
+        UnifiedDataset 实例
+    """
+    return UnifiedDataset(
+        data_path=data_path,
+        tokenizer=tokenizer,
+        task_types=task_types or [],
+        model_style="decoder_only",
+        **kwargs
+    )
 

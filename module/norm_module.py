@@ -116,7 +116,7 @@ class RMSNorm(nn.Module):
 
 
 class WeightNormLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, eps: float = 1e-5):
+    def __init__(self, in_features: int, out_features: int):
         super().__init__()
         self.WeightNormLinear = nn.utils.weight_norm(nn.Linear(in_features=in_features, out_features=out_features), name='weight', dim=0)
 

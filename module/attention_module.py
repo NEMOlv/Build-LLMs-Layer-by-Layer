@@ -10,7 +10,7 @@ from module.embedding_module import RotaryPositionalEmbedding
     :param hidden_dim: dimension of hidden layer
 """
 class selfAttnV1(nn.Module):
-    def __init__(self, hidden_dim, config):
+    def __init__(self, hidden_dim):
         super(selfAttnV1, self).__init__()
 
         self.h_dim = hidden_dim
