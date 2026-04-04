@@ -76,6 +76,7 @@ class Router(nn.Module):
 
         return topk_idx, topk_weight, aux_loss
 
+    # 统计粒度Sequence级：先统计每个 Sequence 内部使用的专家，再按 Batch 平均
     def compute_seq_aux_loss(self, scores, topk_idx):
         # 获取 bsz, seq_len
         b_size, s_len = self.b_size, self.s_len
@@ -102,6 +103,7 @@ class Router(nn.Module):
         aux_loss = (ce * scores.mean(dim=1)).sum(dim=1).mean() * self.alpha
         return aux_loss
 
+    # 统计粒度单Batch级：统计整个 Batch 中所有 Token 使用的专家模型
     def compute_batch_aux_loss(self, scores, topk_idx):
         mask_ce = F.one_hot(topk_idx.view(-1), num_classes=self.n_routed_experts)
         ce = mask_ce.float().mean(0)
