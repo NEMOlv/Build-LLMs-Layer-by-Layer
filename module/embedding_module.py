@@ -689,6 +689,7 @@ class RotaryPositionalEmbedding(nn.Module):
             k: torch.Tensor,
             position_ids: Optional[torch.Tensor] = None,
             unsqueeze_dim: int = 1,
+            offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         应用旋转位置编码到查询和键向量
@@ -698,6 +699,7 @@ class RotaryPositionalEmbedding(nn.Module):
             k: 键向量，shape 与 q 相同
             position_ids: 位置索引，shape [batch_size, seq_len]，None 表示从 0 开始
             unsqueeze_dim: 扩展维度的位置，用于匹配 q/k 的形状
+            offset: 位置偏移量（用于 KV Cache 场景）
             
         Returns:
             (q_rotated, k_rotated): 旋转后的查询和键向量，shape 与输入相同
@@ -710,9 +712,9 @@ class RotaryPositionalEmbedding(nn.Module):
         
         seq_len = q.shape[1] if q.dim() == 4 else q.shape[2]
         
-        # 获取预计算的 cos 和 sin
-        cos = self.cos[:seq_len]
-        sin = self.sin[:seq_len]
+        # 获取预计算的 cos 和 sin（考虑 offset）
+        cos = self.cos[offset : offset + seq_len]
+        sin = self.sin[offset : offset + seq_len]
         
         # 调整维度以匹配 q/k 的形状
         cos = cos.unsqueeze(unsqueeze_dim)
